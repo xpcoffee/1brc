@@ -28,6 +28,7 @@ import java.nio.channels.FileChannel.MapMode;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Spliterator;
@@ -38,6 +39,11 @@ import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 /**
+ * -- 5: try to create segments v2
+ * mean 75.7 ... between (28 s and 200s)!!
+ *
+ * -- 4: try to create segments
+ * mean 240 s
  *
  * -- 3: don't split(;) for arugments
  * mean 75.248 s
@@ -52,13 +58,15 @@ import java.util.stream.StreamSupport;
  * mean 121.768
  */
 public class CalculateAverage_xpcoffee {
-    private static final String FILE = "./measurements.txt";
+  private static final String FILE = "./measurements.txt";
+  // private static final String FILE =
+  // "./src/test/resources/samples/measurements-1.txt";
 
-    private static final char EOL = '\n';
-    private static final char SEPARATOR = ';';
+  private static final char EOL = '\n';
+  private static final char SEPARATOR = ';';
 
-    private static record Measurement(String station, Double value) {
-    }
+  private static record Measurement(String station, Double value) {
+  }
 
   private static record ResultRow(double min, double mean, double max) {
 
@@ -71,146 +79,150 @@ public class CalculateAverage_xpcoffee {
     }
   };
 
-    private static class MeasurementAggregator {
-        private double min = Double.POSITIVE_INFINITY;
-        private double max = Double.NEGATIVE_INFINITY;
-        private double sum;
-        private long count;
+  private static class MeasurementAggregator {
+    private double min = Double.POSITIVE_INFINITY;
+    private double max = Double.NEGATIVE_INFINITY;
+    private double sum;
+    private long count;
+  }
+
+  private static record Segment(Long offset, Long length) {
+  }
+
+  private static ArrayList<Segment> getSegments(RandomAccessFile file, int numSegments) throws IOException {
+    ArrayList<Segment> segments = new ArrayList<>();
+    var fileEnd = file.length();
+    var roughStep = fileEnd / numSegments;
+
+    var cursor = 0L;
+    for (int i = 0; i < numSegments; i++) {
+      var offset = cursor;
+
+      cursor = Math.min(cursor + roughStep, fileEnd);
+      // seek up to EOL of the next chunk
+      file.seek(cursor);
+      while (cursor < fileEnd && file.readByte() != EOL) {
+        cursor++;
+      }
+
+      if (cursor != fileEnd) {
+        // skip over token
+        cursor++;
+      }
+      var length = cursor - offset;
+
+      if (length > 0) {
+
+        segments.add(new Segment(offset, length));
+      }
+
+      if (cursor == fileEnd) {
+        break;
+      }
     }
 
-    private static record Segment(Long offset, Long length) {
-    }
+    return segments;
+  }
 
-    private static ArrayList<Segment> getSegments(RandomAccessFile file, int numSegments) throws IOException {
-        ArrayList<Segment> segments = new ArrayList<>();
-        var fileEnd = file.length();
-        var roughStep = fileEnd / numSegments;
+  private static Stream<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
+    try {
+      var iterator = new Iterator<Measurement>() {
+        ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
 
-        var cursor = 0L;
-        for (int i = 0; i < numSegments; i++) {
-            var offset = cursor;
+        @Override
+        public boolean hasNext() {
+          return bb.hasRemaining();
+        };
 
-            cursor = Math.min(cursor + roughStep, fileEnd);
-            // seek up to EOL of the next chunk
-            file.seek(cursor);
-            while (cursor < fileEnd && file.readByte() != EOL) {
-                cursor++;
+        @Override
+        public Measurement next() {
+          try {
+            if (!bb.hasRemaining()) {
+              return null;
             }
 
-            if (cursor != fileEnd) {
-                // skip over token
-                cursor++;
+            StringBuilder sb = new StringBuilder();
+            var offset = bb.position();
+
+            boolean parsingStation = true;
+            byte[] readbuffer = new byte[100]; // 100bytes max
+
+            String station = null;
+            Double reading = null;
+
+            while (bb.hasRemaining() && (station == null || reading == null)) {
+              var character = bb.get();
+              switch (character) {
+                case SEPARATOR:
+                  station = new String(Arrays.copyOfRange(readbuffer, 0, bb.position() - offset - 1), "UTF-8");
+                  parsingStation = false;
+                  offset = bb.position();
+                  break;
+
+                case EOL:
+                  reading = Double
+                      .parseDouble(new String(Arrays.copyOfRange(readbuffer, 0, bb.position() - offset - 1), "UTF-8"));
+                  offset = bb.position();
+                  parsingStation = true;
+                  break;
+
+                default:
+                  readbuffer[bb.position() - offset - 1] = character;
+              }
+
+              // System.out.println("so far" + new String(Arrays.copyOfRange(readbuffer, 0,
+              // bb.position() - offset), "UTF-8"));
             }
-            var length = cursor - offset;
-            segments.add(new Segment(offset, length));
-        }
 
-        return segments;
-    }
+            return new Measurement(station, reading);
 
-    private static Stream<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
-        try {
-            var iterator = new Iterator<Measurement>() {
-                ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
-
-                @Override
-                public boolean hasNext() {
-                    return bb.hasRemaining();
-                };
-
-                @Override
-                public Measurement next() {
-                    try {
-                        if (!bb.hasRemaining()) {
-                            return null;
-                        }
-
-                        StringBuilder sb = new StringBuilder();
-                        var offset = bb.position();
-                        var length = 0;
-
-                        String station = null;
-                        Double reading = null;
-
-                        while (bb.hasRemaining() && (station == null || reading == null)) {
-                            var character = bb.get();
-                            switch (character) {
-                                case SEPARATOR:
-                                    var stationBytes = new byte[length];
-                                    bb.position(offset); // reset position before copying bytes
-                                    bb.get(stationBytes); // copy bytes
-                                    station = new String(stationBytes, "UTF-8");
-
-                                    bb.get(); // advance over token
-                                    offset = bb.position();
-                                    length = 0;
-                                    break;
-
-                                case EOL:
-                                    var readingBytes = new byte[length];
-                                    bb.position(offset); // reset position before copying bytes
-                                    bb.get(readingBytes); // copy bytes
-                                    reading = Double.parseDouble(new String(readingBytes, "UTF-8"));
-
-                                    bb.get(); // advance over token
-                                    break;
-
-                                default:
-                                    length++;
-                            }
-                        }
-
-                        return new Measurement(station, reading);
-
-                    }
-                    catch (UnsupportedEncodingException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                };
-
-            };
-
-            return StreamSupport
-                    .stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.IMMUTABLE | Spliterator.DISTINCT), false);
-
-        }
-        catch (IOException ex) {
+          } catch (UnsupportedEncodingException ex) {
             throw new RuntimeException(ex);
-        }
+          }
+        };
+
+      };
+
+      return StreamSupport
+          .stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.IMMUTABLE | Spliterator.DISTINCT), false);
+
+    } catch (IOException ex) {
+      throw new RuntimeException(ex);
     }
+  }
 
-    public static void main(String[] args) throws IOException {
-        Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
-                MeasurementAggregator::new,
-                (a, m) -> {
-                    a.min = Math.min(a.min, m.value);
-                    a.max = Math.max(a.max, m.value);
-                    a.sum += m.value;
-                    a.count++;
-                },
-                (agg1, agg2) -> {
-                    agg1.min = Math.min(agg1.min, agg2.min);
-                    agg1.max = Math.max(agg1.max, agg2.max);
-                    agg1.sum = agg1.sum + agg2.sum;
-                    agg1.count = agg1.count + agg2.count;
+  public static void main(String[] args) throws IOException {
+    Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
+        MeasurementAggregator::new,
+        (a, m) -> {
+          a.min = Math.min(a.min, m.value);
+          a.max = Math.max(a.max, m.value);
+          a.sum += m.value;
+          a.count++;
+        },
+        (agg1, agg2) -> {
+          agg1.min = Math.min(agg1.min, agg2.min);
+          agg1.max = Math.max(agg1.max, agg2.max);
+          agg1.sum = agg1.sum + agg2.sum;
+          agg1.count = agg1.count + agg2.count;
 
-                    return agg1;
-                },
-                agg -> {
-                    return new ResultRow(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max);
-                });
+          return agg1;
+        },
+        agg -> {
+          return new ResultRow(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max);
+        });
 
-        var file = new RandomAccessFile(FILE, "r");
-        var fileChannel = file.getChannel();
-        var threads = Runtime.getRuntime().availableProcessors();
-        var segments = getSegments(file, threads);
+    var file = new RandomAccessFile(FILE, "r");
+    var fileChannel = file.getChannel();
+    var threads = Runtime.getRuntime().availableProcessors();
+    var segments = getSegments(file, threads);
 
-        Map<String, ResultRow> measurements = new TreeMap<>(
-                segments.stream()
-                        .parallel()
-                        .flatMap(segment -> readMeasurements(fileChannel, segment))
-                        .collect(groupingBy(m -> m.station(), collector)));
+    Map<String, ResultRow> measurements = new TreeMap<>(
+        segments.stream()
+            .parallel()
+            .flatMap(segment -> readMeasurements(fileChannel, segment))
+            .collect(groupingBy(m -> m.station(), collector)));
 
-        System.out.println(measurements);
-    }
+    System.out.println(measurements);
+  }
 }
