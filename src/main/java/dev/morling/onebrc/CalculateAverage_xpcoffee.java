@@ -29,13 +29,17 @@ import java.util.stream.StreamSupport;
 import static java.util.stream.Collectors.groupingBy;
 
 /**
+ * -- 6: allow parallel on readMeasurements spliterator ; got faster ver time (CPU caching I think)
+ * mean 33.281
+ * Range (min  max):   27.912 s  37.837 s
+ * <p>
  * -- 5: try to create segments v2
  * mean 75.7 ... between (28 s and 200s)!!
  * <p>
  * -- 4: try to create segments
  * mean 240 s
  * <p>
- * -- 3: don't split(;) for arugments
+ * -- 3: don't split(";") for arguments
  * mean 75.248 s
  * <p>
  * -- 2: don't create new aggregator
@@ -118,6 +122,8 @@ public class CalculateAverage_xpcoffee {
 
             if (cursor == fileEnd) {
                 break;
+            } else {
+                cursor++; // start next segment
             }
         }
 
@@ -133,8 +139,6 @@ public class CalculateAverage_xpcoffee {
                 public boolean hasNext() {
                     return bb.hasRemaining();
                 }
-
-                ;
 
                 @Override
                 public Measurement next() {
@@ -173,17 +177,17 @@ public class CalculateAverage_xpcoffee {
             };
 
             return StreamSupport
-                    .stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.IMMUTABLE | Spliterator.DISTINCT), false);
+                    .stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.IMMUTABLE | Spliterator.DISTINCT), true);
 
         } catch (IOException ex) {
             throw new RuntimeException(ex);
         }
     }
 
-    private static record Measurement(String station, Double value) {
+    private record Measurement(String station, Double value) {
     }
 
-    private static record ResultRow(double min, double mean, double max) {
+    private record ResultRow(double min, double mean, double max) {
 
         public String toString() {
             return round(min) + "/" + round(mean) + "/" + round(max);
@@ -194,8 +198,6 @@ public class CalculateAverage_xpcoffee {
         }
     }
 
-    ;
-
     private static class MeasurementAggregator {
         private double min = Double.POSITIVE_INFINITY;
         private double max = Double.NEGATIVE_INFINITY;
@@ -203,6 +205,6 @@ public class CalculateAverage_xpcoffee {
         private long count;
     }
 
-    private static record Segment(Long offset, Long length) {
+    private record Segment(Long offset, Long length) {
     }
 }
