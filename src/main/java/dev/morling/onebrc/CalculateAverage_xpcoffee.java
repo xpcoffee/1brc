@@ -132,6 +132,9 @@ public class CalculateAverage_xpcoffee {
 
     private static Stream<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
         try {
+            // THEORY: the iterator + parallel results in splitting that is uneven and causes a right-heavy parallelization tree.
+            // this makes parallels wait.
+            // TO TEST: move away for an iterator to create a parallel stream.
             var iterator = new Iterator<Measurement>() {
                 final ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
 
