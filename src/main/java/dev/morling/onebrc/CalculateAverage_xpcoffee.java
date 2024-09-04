@@ -156,18 +156,20 @@ public class CalculateAverage_xpcoffee {
                         var character = bb.get();
                         switch (character) {
                             case SEPARATOR:
-                                station = new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8);
+
+                                station = parseStation(readBuffer, bb.position(), offset);
+//                                station = new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8);
                                 offset = bb.position();
                                 break;
 
                             case EOL:
-                                reading = Double
-                                        .parseDouble(new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8));
+                                reading = parseReading(readBuffer, bb.position(), offset);
                                 offset = bb.position();
                                 break;
 
                             default:
-                                readBuffer[bb.position() - offset - 1] = character;
+                                writeToBuffer(readBuffer, bb.position() - offset - 1, character);
+//                                readBuffer[bb.position() - offset - 1] = character;
                         }
                     }
 
@@ -183,6 +185,23 @@ public class CalculateAverage_xpcoffee {
             throw new RuntimeException(ex);
         }
     }
+
+    // --- START extracted to see operations in profiling ----
+
+    public static Double parseReading(byte[] readBuffer, int position, int offset) {
+        return Double
+                .parseDouble(new String(Arrays.copyOfRange(readBuffer, 0, position - offset - 1), StandardCharsets.UTF_8));
+    }
+
+    public static String parseStation(byte[] readBuffer, int position, int offset) {
+        return new String(Arrays.copyOfRange(readBuffer, 0, position - offset - 1), StandardCharsets.UTF_8);
+    }
+
+    public static void writeToBuffer(byte[] buffer, int position, byte value) {
+        buffer[position] = value;
+    }
+
+    // --- END extracted to see operations in profiling ----
 
     private record Measurement(String station, Double value) {
     }
