@@ -21,12 +21,22 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Spliterator;
+import java.util.TreeMap;
+import java.util.function.Consumer;
 import java.util.stream.Collector;
+import java.util.stream.StreamSupport;
 
 import static java.util.stream.Collectors.groupingBy;
 
 /**
+ * -- 8: custom spliterator
+ * 1.739 s ±  0.384 s !!
+ * <p>
+ * this is without optimizing types and aggregation; just the reading optimization
+ * <p>
  * -- 7: arrays of measurements rather than an iterator; chunk by sizes
  * mean 38.237 s ±  4.597 s
  * <p>
@@ -68,15 +78,13 @@ public class CalculateAverage_xpcoffee {
 
         var file = new RandomAccessFile(filePath, "r");
         var fileChannel = file.getChannel();
-        var threads = Runtime.getRuntime().availableProcessors();
-//        var chunkSize = (int) file.length() / threads;
-        var chunkSize = 1024 * 60; // 10mb
-        var segments = getSegments(file, chunkSize);
+        // var threads = Runtime.getRuntime().availableProcessors();
+        // var chunkSize = (int) file.length() / threads;
+        // var chunkSize = 1024 * 60; // 10mb
 
         Map<String, ResultRow> measurements = new TreeMap<>(
-                segments.stream()
-                        .flatMap(segment -> readMeasurements(fileChannel, segment).stream())
-                        .parallel()
+                StreamSupport.stream(new SegmentSpliterator(fileChannel, 0, (int) fileChannel.size()), true)
+                        // .parallel()
                         .collect(groupingBy(Measurement::station, getMeasurementProcessor())));
 
         System.out.println(measurements);
@@ -102,75 +110,108 @@ public class CalculateAverage_xpcoffee {
                 agg -> new ResultRow(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max));
     }
 
-    private static ArrayList<Segment> getSegments(RandomAccessFile file, int chunkSize) throws IOException {
-        ArrayList<Segment> segments = new ArrayList<>();
-        var fileEnd = file.length();
-        var numSegments = Math.ceilDiv(fileEnd, chunkSize);
+    private static class SegmentSpliterator implements Spliterator<Measurement> {
+        private final FileChannel fileChannel;
+        private final ByteBuffer memoryMappedFile;
+        private final byte[] readBuffer = new byte[100]; // 100bytes max for the name of the station
+        private final int fileCursor;
 
-        for (int i = 0; i < numSegments; i++) {
-            final var offset = file.getFilePointer();
-            final var estimatedChunkEnd = offset + chunkSize;
-            if (estimatedChunkEnd >= fileEnd) {
-                segments.add(new Segment(offset, fileEnd - offset));
-                break;
-            }
-
-            // seek up to EOL of the next chunk
-            file.seek(estimatedChunkEnd);
-            byte currentByte = 0;
-            while (currentByte != EOL) {
-                currentByte = file.readByte();
-            }
-
-            var length = file.getFilePointer() - offset;
-            if (length > 0) {
-                segments.add(new Segment(offset, length));
-            }
+        SegmentSpliterator(FileChannel fileChannel, int fileCursor, int length) throws IOException {
+            this.fileChannel = fileChannel;
+            this.fileCursor = fileCursor;
+            memoryMappedFile = fileChannel.map(MapMode.READ_ONLY, fileCursor, length);
         }
 
-        return segments;
-    }
-
-    private static List<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
-        ArrayList<Measurement> measurements = new ArrayList<>();
-
-        try {
-            final ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
-
-            if (!bb.hasRemaining()) {
-                return null;
-            }
-
-            var offset = bb.position();
-            byte[] readBuffer = new byte[100]; // 100bytes max
+        @Override
+        public boolean tryAdvance(Consumer<? super Measurement> action) {
             String station = null;
+            var initialOffset = memoryMappedFile.position();
+            var offset = initialOffset;
 
-            while (bb.hasRemaining()) {
-                var character = bb.get();
+            while (memoryMappedFile.hasRemaining()) {
+                var character = memoryMappedFile.get();
                 switch (character) {
                     case SEPARATOR:
-                        station = parseStation(readBuffer, bb.position(), offset);
-                        // station = new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8);
-                        offset = bb.position();
+                        station = parseStation(readBuffer, memoryMappedFile.position(), offset);
+                        offset = memoryMappedFile.position();
                         break;
 
                     case EOL:
-                        var reading = parseReading(readBuffer, bb.position(), offset);
-                        measurements.add(new Measurement(station, reading));
-                        offset = bb.position();
-                        break;
+                        var reading = parseReading(readBuffer, memoryMappedFile.position(), offset);
+                        action.accept(new Measurement(station, reading));
+                        return true;
 
                     default:
-                        writeToBuffer(readBuffer, bb.position() - offset - 1, character);
-                        // readBuffer[bb.position() - offset - 1] = character;
+                        writeToBuffer(
+                                readBuffer,
+                                memoryMappedFile.position() - offset - 1, // -1 because position increase in get, but we want original position
+                                character);
+                }
+            }
+            return false;
+        }
+
+        private void printOutRecord(int offset) {
+            var initialPosition = memoryMappedFile.position();
+            memoryMappedFile.position(offset);
+            byte[] bytes = new byte[memoryMappedFile.limit() - offset];
+
+            var pos = memoryMappedFile.position() - offset;
+            while (memoryMappedFile.hasRemaining() && bytes[pos] != EOL) {
+                pos = memoryMappedFile.position() - offset;
+                bytes[pos] = memoryMappedFile.get();
+            }
+
+            System.out.println(new String(Arrays.copyOfRange(bytes, 0, memoryMappedFile.position() - offset - 1), StandardCharsets.UTF_8));
+            memoryMappedFile.position(initialPosition);
+        }
+
+        private void printOutFullRange() {
+            var initialPosition = memoryMappedFile.position();
+            memoryMappedFile.position(0);
+            byte[] bytes = new byte[memoryMappedFile.limit()];
+
+            while (memoryMappedFile.hasRemaining()) {
+                var pos = memoryMappedFile.position();
+                bytes[pos] = memoryMappedFile.get();
+            }
+
+            System.out.println(new String(Arrays.copyOfRange(bytes, 0, memoryMappedFile.position() - 1), StandardCharsets.UTF_8));
+            memoryMappedFile.position(initialPosition);
+        }
+
+        @Override
+        public Spliterator<Measurement> trySplit() {
+            if (memoryMappedFile.remaining() < 100) { // smallest valid record is 8 e.g. "aaaa;0.0"
+                return null;
+            }
+
+            var newLimit = Math.ceilDiv(memoryMappedFile.remaining(), 2);
+            while (memoryMappedFile.get(newLimit - 1) != EOL) { // find closest newline
+                newLimit--;
+                if (newLimit == 0) {
+                    return null;
                 }
             }
 
-        } catch (IOException ex) {
-            throw new RuntimeException(ex);
+            try {
+                var newSplit = new SegmentSpliterator(fileChannel, fileCursor + newLimit, memoryMappedFile.limit() - newLimit);
+                this.memoryMappedFile.limit(newLimit);
+                return newSplit;
+            } catch (IOException ex) {
+                return null;
+            }
         }
 
-        return measurements;
+        @Override
+        public long estimateSize() {
+            return this.memoryMappedFile.remaining();
+        }
+
+        @Override
+        public int characteristics() {
+            return ORDERED | SIZED | SUBSIZED | CONCURRENT | IMMUTABLE | NONNULL;
+        }
     }
 
     // --- START extracted to see operations in profiling ----
