@@ -23,15 +23,21 @@ import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collector;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 import static java.util.stream.Collectors.groupingBy;
 
 /**
+ * -- 7: arrays of measurements rather than an iterator; chunk by sizes
+ * mean 38.237 s ±  4.597 s
+ * <p>
+ * much more consistent times but ooms with less memory
+ *
+ * <p>
  * -- 6: allow parallel on readMeasurements spliterator ; got faster ver time (CPU caching I think)
  * mean 33.281
  * Range (min  max):   27.912 s  37.837 s
+ * <p>
+ * lots of "self time" in profile; looks like iterator parallelism getting in the way
  * <p>
  * -- 5: try to create segments v2
  * mean 75.7 ... between (28 s and 200s)!!
@@ -52,23 +58,25 @@ import static java.util.stream.Collectors.groupingBy;
  * mean 121.768
  */
 public class CalculateAverage_xpcoffee {
-    private static final String FILE = "./measurements.txt";
-    // private static final String FILE =
-    // "./src/test/resources/samples/measurements-1.txt";
+    private static final String DEFAULT_FILE_PATH = "./measurements.txt";
 
     private static final char EOL = '\n';
     private static final char SEPARATOR = ';';
 
     public static void main(String[] args) throws IOException {
-        var file = new RandomAccessFile(FILE, "r");
+        String filePath = args.length > 0 ? args[0] : DEFAULT_FILE_PATH;
+
+        var file = new RandomAccessFile(filePath, "r");
         var fileChannel = file.getChannel();
         var threads = Runtime.getRuntime().availableProcessors();
-        var segments = getSegments(file, threads);
+//        var chunkSize = (int) file.length() / threads;
+        var chunkSize = 1024 * 60; // 10mb
+        var segments = getSegments(file, chunkSize);
 
         Map<String, ResultRow> measurements = new TreeMap<>(
                 segments.stream()
+                        .flatMap(segment -> readMeasurements(fileChannel, segment).stream())
                         .parallel()
-                        .flatMap(segment -> readMeasurements(fileChannel, segment))
                         .collect(groupingBy(Measurement::station, getMeasurementProcessor())));
 
         System.out.println(measurements);
@@ -94,99 +102,75 @@ public class CalculateAverage_xpcoffee {
                 agg -> new ResultRow(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max));
     }
 
-    private static ArrayList<Segment> getSegments(RandomAccessFile file, int numSegments) throws IOException {
+    private static ArrayList<Segment> getSegments(RandomAccessFile file, int chunkSize) throws IOException {
         ArrayList<Segment> segments = new ArrayList<>();
         var fileEnd = file.length();
-        var roughStep = fileEnd / numSegments;
+        var numSegments = Math.ceilDiv(fileEnd, chunkSize);
 
-        var cursor = 0L;
         for (int i = 0; i < numSegments; i++) {
-            var offset = cursor;
+            final var offset = file.getFilePointer();
+            final var estimatedChunkEnd = offset + chunkSize;
+            if (estimatedChunkEnd >= fileEnd) {
+                segments.add(new Segment(offset, fileEnd - offset));
+                break;
+            }
 
-            cursor = Math.min(cursor + roughStep, fileEnd);
             // seek up to EOL of the next chunk
-            file.seek(cursor);
-            while (cursor < fileEnd && file.readByte() != EOL) {
-                cursor++;
+            file.seek(estimatedChunkEnd);
+            byte currentByte = 0;
+            while (currentByte != EOL) {
+                currentByte = file.readByte();
             }
 
-            if (cursor != fileEnd) {
-                // skip over token
-                cursor++;
-            }
-            var length = cursor - offset;
-
+            var length = file.getFilePointer() - offset;
             if (length > 0) {
                 segments.add(new Segment(offset, length));
-            }
-
-            if (cursor == fileEnd) {
-                break;
-            } else {
-                cursor++; // start next segment
             }
         }
 
         return segments;
     }
 
-    private static Stream<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
+    private static List<Measurement> readMeasurements(FileChannel fileChannel, Segment segment) {
+        ArrayList<Measurement> measurements = new ArrayList<>();
+
         try {
-            // THEORY: the iterator + parallel results in splitting that is uneven and causes a right-heavy parallelization tree.
-            // this makes parallels wait.
-            // TO TEST: move away for an iterator to create a parallel stream.
-            var iterator = new Iterator<Measurement>() {
-                final ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
+            final ByteBuffer bb = fileChannel.map(MapMode.READ_ONLY, segment.offset(), segment.length());
 
-                @Override
-                public boolean hasNext() {
-                    return bb.hasRemaining();
+            if (!bb.hasRemaining()) {
+                return null;
+            }
+
+            var offset = bb.position();
+            byte[] readBuffer = new byte[100]; // 100bytes max
+            String station = null;
+
+            while (bb.hasRemaining()) {
+                var character = bb.get();
+                switch (character) {
+                    case SEPARATOR:
+                        station = parseStation(readBuffer, bb.position(), offset);
+                        // station = new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8);
+                        offset = bb.position();
+                        break;
+
+                    case EOL:
+                        var reading = parseReading(readBuffer, bb.position(), offset);
+                        measurements.add(new Measurement(station, reading));
+                        offset = bb.position();
+                        break;
+
+                    default:
+                        writeToBuffer(readBuffer, bb.position() - offset - 1, character);
+                        // readBuffer[bb.position() - offset - 1] = character;
                 }
-
-                @Override
-                public Measurement next() {
-                    if (!bb.hasRemaining()) {
-                        return null;
-                    }
-
-                    var offset = bb.position();
-                    byte[] readBuffer = new byte[100]; // 100bytes max
-
-                    String station = null;
-                    Double reading = null;
-
-                    while (bb.hasRemaining() && (station == null || reading == null)) {
-                        var character = bb.get();
-                        switch (character) {
-                            case SEPARATOR:
-
-                                station = parseStation(readBuffer, bb.position(), offset);
-//                                station = new String(Arrays.copyOfRange(readBuffer, 0, bb.position() - offset - 1), StandardCharsets.UTF_8);
-                                offset = bb.position();
-                                break;
-
-                            case EOL:
-                                reading = parseReading(readBuffer, bb.position(), offset);
-                                offset = bb.position();
-                                break;
-
-                            default:
-                                writeToBuffer(readBuffer, bb.position() - offset - 1, character);
-//                                readBuffer[bb.position() - offset - 1] = character;
-                        }
-                    }
-
-                    return new Measurement(station, reading);
-                }
-
-            };
-
-            return StreamSupport
-                    .stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.IMMUTABLE | Spliterator.DISTINCT), true);
+            }
 
         } catch (IOException ex) {
             throw new RuntimeException(ex);
         }
+
+        return measurements;
     }
 
     // --- START extracted to see operations in profiling ----
