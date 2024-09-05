@@ -55,6 +55,8 @@ import static java.util.stream.Collectors.groupingBy;
  * -- 4: try to create segments
  * mean 240 s
  * <p>
+ * was not parallelizing reading measurements
+ * <p>
  * -- 3: don't split(";") for arguments
  * mean 75.248 s
  * <p>
@@ -78,13 +80,9 @@ public class CalculateAverage_xpcoffee {
 
         var file = new RandomAccessFile(filePath, "r");
         var fileChannel = file.getChannel();
-        // var threads = Runtime.getRuntime().availableProcessors();
-        // var chunkSize = (int) file.length() / threads;
-        // var chunkSize = 1024 * 60; // 10mb
 
         Map<String, ResultRow> measurements = new TreeMap<>(
                 StreamSupport.stream(new SegmentSpliterator(fileChannel, 0, (int) fileChannel.size()), true)
-                        // .parallel()
                         .collect(groupingBy(Measurement::station, getMeasurementProcessor())));
 
         System.out.println(measurements);
@@ -125,8 +123,8 @@ public class CalculateAverage_xpcoffee {
         @Override
         public boolean tryAdvance(Consumer<? super Measurement> action) {
             String station = null;
-            var initialOffset = memoryMappedFile.position();
-            var offset = initialOffset;
+//            var initialOffset = memoryMappedFile.position(); // utility; use with printOutRecord
+            var offset = memoryMappedFile.position();
 
             while (memoryMappedFile.hasRemaining()) {
                 var character = memoryMappedFile.get();
@@ -151,6 +149,7 @@ public class CalculateAverage_xpcoffee {
             return false;
         }
 
+        // utility for visualizing a single record
         private void printOutRecord(int offset) {
             var initialPosition = memoryMappedFile.position();
             memoryMappedFile.position(offset);
@@ -166,6 +165,7 @@ public class CalculateAverage_xpcoffee {
             memoryMappedFile.position(initialPosition);
         }
 
+        // utility for visualizing the segment
         private void printOutFullRange() {
             var initialPosition = memoryMappedFile.position();
             memoryMappedFile.position(0);
